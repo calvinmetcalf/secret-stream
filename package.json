@@ -21,5 +21,9 @@
   },
   "devDependencies": {
     "tape": "^3.5.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:calvinmetcalf/secret-stream.git"
   }
 }
