@@ -1,158 +1,109 @@
 'use strict';
+var duplexify = require('duplexify');
+var PassThrough = require('readable-stream').PassThrough;
 var createECDH = require('create-ecdh');
-var sign = require('browserify-sign');
-var stream = require('readable-stream');
-var inherits = require('inherits');
+var createECDHBrowser = require('create-ecdh/browser');
+var cryptoStream = require('crypto-stream');
 var randomBytes = require('randombytes');
 var createHmac = require('create-hmac');
-var aes = require('browserify-aes');
-var hmacStream = require('hmac-stream');
-var duplexify = require('duplexify');
-var ZEROBUF = new Buffer(32);
-ZEROBUF.fill(0);
-module.exports = cipherStream;
-function cipherStream(privateKey, publicKey, reciever){
-  var dh = createECDH('secp256k1');
-  var dhPublic = dh.generateKeys();
-
-  var random = randomBytes(16);
-  var decrypter = new Decrypter(publicKey);
-  var encryptedOut = new stream.PassThrough();
-  var len = new Buffer([16, dhPublic.length]);
-  var sig = sign.createSign('RSA-SHA256').update(len).update(random).update(dhPublic).sign(privateKey);
-  var sigLen = new Buffer(2);
-  sigLen.writeUInt16BE(sig.length, 0);
-  encryptedOut.write(sigLen);
-  encryptedOut.write(sig);
-  encryptedOut.write(len);
-  encryptedOut.write(random);
-  encryptedOut.write(dhPublic);
-  var plainOut = duplexify();
-  var cipherOut = duplexify(decrypter, encryptedOut);
-  decrypter.on('reply', function (data) {
-    var secret = dh.computeSecret(data.dh);
-    var otherRandom = data.random;
-    var combinedRandom = reciever ? Buffer.concat([random, otherRandom]) : Buffer.concat([otherRandom, random]);
-    var key = createHmac('sha256', combinedRandom).update(secret).digest();
-    var iv1 = new Buffer(16);
-    iv1.fill(0);
-    var iv2 = new Buffer(16);
-    iv2.fill(0);
-    iv2[0] = 0x80;
-    var encryptIv, decryptIv;
-    if (reciever) {
-      encryptIv = iv1;
-      decryptIv = iv2;
-    } else {
-      encryptIv = iv2;
-      decryptIv = iv1;
-    }
-    var cipher = aes.createCipheriv('aes-256-ctr', key, encryptIv);
-    var authStream = new hmacStream.Authenticate(cipher.update(ZEROBUF));
-    cipher.pipe(authStream).pipe(encryptedOut);
-    plainOut.setWritable(cipher);
-    var decipher = aes.createCipheriv('aes-256-ctr', key, decryptIv);
-    var verifyStream = new hmacStream.Verify(decipher.update(ZEROBUF));
-    decrypter.pipe(verifyStream).pipe(decipher);
-    verifyStream.on('error', function (e) {
-      decipher.emit('error', e);
-    });
-    plainOut.setReadable(decipher);
-  });
-  return {
-    plain: plainOut,
-    secret: cipherOut
-  };
-}
-
-inherits(Decrypter, stream.Transform);
-function Decrypter(publicKey) {
-  stream.Transform.call(this);
-  this.publicKey = publicKey;
-  this.waitingToStart = true;
-  this.cache = new Buffer('');
-  this.cipher = null;
-  this.sig = null;
-  this.sigLen = null;
-  this.random = null;
-  this.randDhLength = null;
-  this.randLenth = null;
-  this.dhLength = null;
-  this.dh = null;
-
-}
-Decrypter.prototype._transform = function (chunk, _, next) {
-  var self = this;
-  if (this.waitingToStart) {
-    this.cache = Buffer.concat([this.cache, chunk]);
-    if (this.sigLen === null) {
-      if (this.cache.length < 2) {
-        return next();
-      }
-      this.sigLen = this.cache.readUInt16BE(0);
-      this.cache = this.cache.slice(2);
-    }
-    if (this.sig === null) {
-      if (this.cache.length < this.sigLen) {
-        return next();
-      }
-      this.sig = this.cache.slice(0, this.sigLen);
-      this.cache = this.cache.slice(this.sigLen);
-    }
-    if (this.randDhLength === null) {
-      if (this.cache.length < 2) {
-        return next();
-      }
-      this.randDhLength = this.cache.slice(0, 2);
-      this.cache = this.cache.slice(2);
-      this.randLength = this.randDhLength[0];
-      this.dhLength = this.randDhLength[1];
-    }
-    if (this.random === null) {
-      if (this.cache.length < this.randLenth) {
-        return next();
-      }
-      this.random = this.cache.slice(0, this.randLength);
-      this.cache = this.cache.slice(this.randLength);
-    }
-    if (this.dh === null) {
-      if (this.cache.length < this.dhLength) {
-        return next();
-      }
-      this.dh = this.cache.slice(0, this.dhLength);
-      this.cache = this.cache.slice(this.dhLength);
-      var verified = sign.createVerify('RSA-SHA256').update(this.randDhLength)
-        .update(this.random).update(this.dh).verify(this.publicKey, this.sig);
-      if (verified) {
-        this.emit('reply', {
-          dh: this.dh,
-          random: this.random
-        });
-        this.waitingToStart = false;
-        if (this.cache.length) {
-          this.push(this.cache);
-        }
-        self.publicKey = null;
-        self.cache = null;
-        self.sig = null;
-        self.sigLen = null;
-        self.random = null;
-        self.randDhLength = null;
-        self.randLenth = null;
-        self.dhLength = null;
-        self.dh = null;
-        return next();
-      } else {
-        this.emit('error', new Error('unable to verify'));
-        return next();
-      }
-    }
-  }
-  this.push(chunk);
-  next();
+var kdf = require('pbkdf2');
+var HeaderStream = require('headerstream');
+var keyLens = {
+  secp256k1: 33,
+  secp224r1: 29,
+  prime256v1: 33,
+  prime192v1: 25,
+  ed25519: 33,
+  curve25519: 32
 };
+keyLens.p224 = keyLens.secp224r1;
+keyLens.p256 = keyLens.secp256r1 = keyLens.prime256v1;
+keyLens.p192 = keyLens.secp192r1 = keyLens.prime192v1;
+var ITERATIONS = 500; // mainly just to smooth out the size
+
+function getECDH(type) {
+  try {
+    return createECDH(type);
+  } catch (e) {
+    return createECDHBrowser(type);
+  }
+}
 /*
 
 plain writable -> encrypted readable
 encrypted writable -> plain readable
 */
+function passfn(a){
+  return a;
+}
+function makeEmbelishKey(type, yourPrivate, theirPublic, dh, otherPublic) {
+  return embelishKey;
+  function embelishKey(key, decrypt) {
+    var hmac = createHmac('sha256', key);
+    var piece1 = dh.computeSecret(theirPublic);
+    var dh2 = getECDH(type);
+    dh2.generateKeys();
+    dh2.setPrivateKey(yourPrivate);
+    var piece2 = dh2.computeSecret(otherPublic);
+    if (decrypt) {
+      hmac.update(piece1).update(piece2);
+    } else {
+      hmac.update(piece2).update(piece1);
+    }
+    return hmac.digest();
+  }
+}
+function createDHpair(type, yourPrivate, theirPublic) {
+  var encrypter = duplexify();
+  var decrypter = duplexify();
+  var encrypterOut = new PassThrough();
+  encrypter.setReadable(encrypterOut);
+  type = type || 'secp256k1';
+  if (!keyLens[type]) {
+    throw new Error('unknown curve');
+  }
+  var dh = getECDH(type);
+  var publicKey = dh.generateKeys(null, 'compressed');
+  var salt = randomBytes(16);
+  encrypterOut.write(publicKey);
+  encrypterOut.write(salt);
+  var decrypterIn = new HeaderStream((keyLens[type] + 16), function (err, resp) {
+    if (err) {
+      decrypter.emit('error', err);
+      return encrypter.emit('error', err);
+    }
+    var otherPublicKey = resp.slice(0, -16);
+    var otherSalt = resp.slice(-16);
+    var encryptSalt = otherSalt + salt;
+    var decryptSalt = salt + otherSalt;
+    var derivedSecret = dh.computeSecret(otherPublicKey);
+    var embelishKey;
+    if (!yourPrivate || !theirPublic) {
+      embelishKey = passfn;
+    } else {
+      embelishKey = makeEmbelishKey(type, yourPrivate, theirPublic, dh, otherPublicKey);
+    }
+    kdf.pbkdf2(derivedSecret, encryptSalt, ITERATIONS, 32, 'sha256', function (err, resp) {
+      if (err) {
+        return encrypter.emit('error', err);
+      }
+      var crypto = cryptoStream.encrypt(embelishKey(resp));
+      crypto.pipe(encrypterOut);
+      encrypter.setWritable(crypto);
+    });
+    kdf.pbkdf2(derivedSecret, decryptSalt, ITERATIONS, 32, 'sha256', function (err, resp) {
+      if (err) {
+        return decrypter.emit('error', err);
+      }
+      var crypto = cryptoStream.decrypt(embelishKey(resp, true));
+      decrypterIn.pipe(crypto);
+      decrypter.setReadable(crypto);
+    });
+  });
+  decrypter.setWritable(decrypterIn);
+  return {
+    secret: duplexify(decrypter, encrypter),
+    plain: duplexify(encrypter, decrypter)
+  };
+}
+module.exports = createDHpair;
